@@ -1,17 +1,54 @@
-# pdf-merge-compress
-
 # PDF Toolkit — Setup Guide (Windows)
 
 This gives you a double-clickable `PDF Toolkit.exe` — no Python knowledge needed to *use* it.
 You only need Python once, to *build* the exe.
 
 ## What it does
+Three tabs:
+
+**Merge & Compress**
 - **Merge**: combine any number of PDFs into one, in the order you list them.
+- **Edit Page Order...** *(optional)*: opens a page-by-page list, with a thumbnail preview,
+  so you can reorder or drop individual pages before merging — not just whole files. Click
+  a thumbnail to jump to it in the list. Leave it alone and merging works the normal way
+  (every page of every file, in list order).
 - **Compress**: shrink file size (downsamples/re-encodes embedded images + strips redundant
   data). If you select Compress **without** Merge, it compresses **every selected PDF
   separately** — you get one compressed output per input, not just one combined file.
-- **Both together**: merges first, then compresses the merged result.
-- Bad/corrupt files in a batch are skipped and reported — they won't stop the rest.
+- **Both together**: merges first (using your custom page order if you set one), then
+  compresses the merged result.
+
+**Split**
+- Add any number of PDFs — each one is split independently, so you can batch several at once.
+- Click a file in the list to preview all of its pages as thumbnails before splitting —
+  useful for picking where a custom range should cut.
+- Three modes:
+  - **One PDF per page** — every page becomes its own file.
+  - **Every N pages** — chunks of N consecutive pages (last chunk keeps whatever's left over).
+  - **Custom page ranges** — type something like `1-3, 5, 7-end`. This is checked against
+    each file's own page count, so mixed-length files in the same batch are handled correctly.
+
+**Reorder**
+- Open a single PDF, reorder or remove its own pages (with a click-to-jump thumbnail
+  preview), then Save As a new file. This is for when you just need to fix page order or
+  drop a page or two, without merging anything else in.
+
+All three tabs: bad/corrupt files in a batch are skipped and reported — they won't stop
+the rest.
+
+## Does it break OCR / searchable text?
+No. Merge, Split, and the page-copying part of Reorder all copy each page's full internal
+structure (PyMuPDF's `insert_pdf`) rather than flattening it into an image — so any
+existing invisible OCR text layer travels with the page untouched. Compress only ever
+swaps out the embedded *image* object for a smaller one; it never touches the text layer.
+Every one of these operations also runs an automatic check — comparing extracted text
+character-count before and after — and logs the result, so you get proof rather than my
+word for it. Look for a line like:
+```
+Text/OCR check (merge): 1042 -> 1042 characters - OK, nothing lost.
+```
+in the log box after any run. If it ever shows a drop, it'll say `[WARNING]` instead of
+`OK` — that's your cue to check the output by hand before relying on it.
 
 ## Step 1 — Install Python (one-time, only on the build machine)
 1. Go to https://www.python.org/downloads/ and download the latest Windows installer.
@@ -42,12 +79,26 @@ still far lighter than the Electron/npm-based tools you tried).
 
 ## Step 4 — Using it
 1. Double-click `PDF Toolkit.exe`.
-2. **Add Files** → pick your PDFs (any number).
-3. Reorder with **Move Up/Move Down** if you're merging (order = page order in the merged file).
+
+**To merge/compress:**
+2. On the **Merge & Compress** tab, click **Add Files** → pick your PDFs (any number).
+3. Reorder with **Move Up/Move Down** (whole-file order), or click **Edit Page Order...**
+   if you need to reorder or remove individual pages instead.
 4. Tick **Merge**, **Compress**, or both.
-5. Pick a **Compression level** (Medium is a good default).
-6. Pick an **Output folder**.
-7. Click **Run**. Progress and results are shown in the log box; a confirmation pops up when done.
+5. Pick a **Compression level** (Medium is a good default) and an **Output folder**.
+6. Click **Run**. Progress and results show in the log box; a confirmation pops up when done.
+
+**To split:**
+2. Switch to the **Split** tab, click **Add Files** → pick your PDFs.
+3. Click a file in the list to preview its pages.
+4. Choose a split mode (one page per file / every N pages / custom ranges) and an
+   **Output folder**.
+5. Click **Split**.
+
+**To reorder a single PDF:**
+2. Switch to the **Reorder** tab, click **Open PDF...** → pick one file.
+3. Use **Move Up/Move Down/Remove Selected**, or click a thumbnail to jump to it in the list.
+4. Click **Save As...** and choose where to save the result.
 
 ## Notes
 - If Windows SmartScreen warns about an "unrecognized app" the first time you run the exe,
