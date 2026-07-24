@@ -414,12 +414,21 @@ def process(files, output_dir, do_merge, do_compress, quality=65, max_dim=1600,
 
 class ThumbnailStrip(ttk.Frame):
     THUMB_ZOOM = 0.18
+    DRAG_THRESHOLD = 5  # pixels of movement before a press counts as a drag, not a click
 
-    def __init__(self, parent, on_click=None, height=190):
+    def __init__(self, parent, on_click=None, on_reorder=None, height=190):
         super().__init__(parent)
         self.on_click = on_click
+        self.on_reorder = on_reorder  # callback(from_index, to_index); enables dragging
         self._photo_refs = []
         self._load_token = 0
+        self._cells = []           # ordered list of the outer cell Frames
+        self._labels = []          # ordered list of the image Labels (for drag highlight)
+        self._number_labels = []   # ordered list of the page-number caption Labels
+        self._drag_idx = None
+        self._drag_started = False
+        self._press_xy = None
+        self._hover_idx = None
 
         self.canvas = tk.Canvas(self, height=height, bg="#e8e8e8", highlightthickness=0)
         hbar = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
@@ -439,6 +448,12 @@ class ThumbnailStrip(ttk.Frame):
         for w in self.inner.winfo_children():
             w.destroy()
         self._photo_refs.clear()
+        self._cells.clear()
+        self._labels.clear()
+        self._number_labels.clear()
+        self._drag_idx = None
+        self._drag_started = False
+        self._hover_idx = None
         self.status_label.config(text=status_text)
         self.status_label.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -483,18 +498,103 @@ class ThumbnailStrip(ttk.Frame):
         if token != self._load_token:
             return  # a newer load() call already superseded this one
         self.status_label.place_forget()
+        draggable = self.on_reorder is not None
         for i, img in enumerate(images):
             photo = ImageTk.PhotoImage(img)
             self._photo_refs.append(photo)
             cell = ttk.Frame(self.inner)
             cell.pack(side="left", padx=4, pady=4)
+            cursor = "fleur" if draggable else ("hand2" if self.on_click else "")
             lbl = tk.Label(cell, image=photo, relief="solid", bd=1,
-                            cursor="hand2" if self.on_click else "")
+                            highlightthickness=3, highlightbackground="#e8e8e8", cursor=cursor)
             lbl.pack()
-            ttk.Label(cell, text=str(i + 1)).pack()
-            if self.on_click:
+            num_lbl = ttk.Label(cell, text=str(i + 1))
+            num_lbl.pack()
+            self._cells.append(cell)
+            self._labels.append(lbl)
+            self._number_labels.append(num_lbl)
+            if draggable:
+                lbl.bind("<ButtonPress-1>", lambda e, idx=i: self._on_press(e, idx))
+                lbl.bind("<B1-Motion>", self._on_drag_motion)
+                lbl.bind("<ButtonRelease-1>", self._on_release)
+            elif self.on_click:
                 lbl.bind("<Button-1>", lambda e, idx=i: self.on_click(idx))
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    # -- drag to reorder --------------------------------------------------
+    def _on_press(self, event, idx):
+        self._drag_idx = idx
+        self._drag_started = False
+        self._press_xy = (event.x_root, event.y_root)
+
+    def _on_drag_motion(self, event):
+        if self._drag_idx is None:
+            return
+        if not self._drag_started:
+            dx = abs(event.x_root - self._press_xy[0])
+            dy = abs(event.y_root - self._press_xy[1])
+            if dx < self.DRAG_THRESHOLD and dy < self.DRAG_THRESHOLD:
+                return
+            self._drag_started = True
+        target = self._closest_index(event.x_root)
+        if target != self._hover_idx:
+            if self._hover_idx is not None and self._hover_idx < len(self._labels):
+                self._labels[self._hover_idx].configure(highlightbackground="#e8e8e8")
+            if target is not None and target != self._drag_idx:
+                self._labels[target].configure(highlightbackground="#2a8a4a")
+                self._hover_idx = target
+            else:
+                self._hover_idx = None
+
+    def _on_release(self, event):
+        if self._hover_idx is not None and self._hover_idx < len(self._labels):
+            self._labels[self._hover_idx].configure(highlightbackground="#e8e8e8")
+        if self._drag_started and self._drag_idx is not None:
+            target = self._closest_index(event.x_root)
+            if target is not None and target != self._drag_idx:
+                self.local_reorder(self._drag_idx, target)
+                if self.on_reorder:
+                    self.on_reorder(self._drag_idx, target)
+        elif self._drag_idx is not None and self.on_click:
+            self.on_click(self._drag_idx)  # was a click, not a drag
+        self._drag_idx = None
+        self._drag_started = False
+        self._hover_idx = None
+
+    def local_reorder(self, from_idx, to_idx):
+        """Repacks already-rendered thumbnails into a new order instantly, without
+        re-fetching/re-rendering from disk. Callers still need to update their own
+        source-of-truth entries list and text listbox separately."""
+        cell = self._cells.pop(from_idx)
+        lbl = self._labels.pop(from_idx)
+        num_lbl = self._number_labels.pop(from_idx)
+        photo = self._photo_refs.pop(from_idx)
+        self._cells.insert(to_idx, cell)
+        self._labels.insert(to_idx, lbl)
+        self._number_labels.insert(to_idx, num_lbl)
+        self._photo_refs.insert(to_idx, photo)
+        for c in self._cells:
+            c.pack_forget()
+        for c in self._cells:
+            c.pack(side="left", padx=4, pady=4)
+        for i, num_lbl in enumerate(self._number_labels, start=1):
+            num_lbl.configure(text=str(i))
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _closest_index(self, x_root):
+        if not self._cells:
+            return None
+        best_i, best_dist = None, None
+        for i, cell in enumerate(self._cells):
+            try:
+                cx = cell.winfo_rootx() + cell.winfo_width() / 2
+            except tk.TclError:
+                continue
+            dist = abs(x_root - cx)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_i = i
+        return best_i
 
 
 class PageOrderDialog(tk.Toplevel):
@@ -533,7 +633,8 @@ class PageOrderDialog(tk.Toplevel):
 
         preview_frame = ttk.LabelFrame(self, text="Preview")
         preview_frame.pack(fill="both", expand=True, padx=10, pady=(4, 4))
-        self.preview = ThumbnailStrip(preview_frame, on_click=self._select_index, height=150)
+        self.preview = ThumbnailStrip(preview_frame, on_click=self._select_index,
+                                       on_reorder=self._thumb_reordered, height=150)
         self.preview.pack(fill="both", expand=True, padx=6, pady=6)
 
         bottom = ttk.Frame(self)
@@ -549,7 +650,13 @@ class PageOrderDialog(tk.Toplevel):
             self.listbox.selection_set(idx)
             self.listbox.see(idx)
 
-    def _refresh(self):
+    def _thumb_reordered(self, from_idx, to_idx):
+        entry = self.entries.pop(from_idx)
+        self.entries.insert(to_idx, entry)
+        self._refresh_listbox_text()  # preview already updated itself instantly
+        self._select_index(to_idx)
+
+    def _refresh_listbox_text(self):
         self.listbox.delete(0, "end")
         counts = {}
         for f, _ in self.entries:
@@ -562,6 +669,11 @@ class PageOrderDialog(tk.Toplevel):
                     counts[f] = "?"
         for i, (f, idx) in enumerate(self.entries, start=1):
             self.listbox.insert("end", f"{i:02d}. {os.path.basename(f)} — page {idx + 1} of {counts.get(f, '?')}")
+
+    def _refresh(self):
+        """Full refresh: listbox text + reload thumbnails from disk. Use whenever the
+        actual set of pages changes (remove/reset/initial load), not for pure reordering."""
+        self._refresh_listbox_text()
         self.preview.load_entries(self.entries)
 
     def _move(self, direction):
@@ -788,7 +900,8 @@ class PDFToolkitApp:
 
         preview_frame = ttk.LabelFrame(parent, text="Preview (click a thumbnail to jump to it)")
         preview_frame.pack(fill="both", expand=True, **pad)
-        self.reorder_preview = ThumbnailStrip(preview_frame, on_click=self._reorder_select_index, height=150)
+        self.reorder_preview = ThumbnailStrip(preview_frame, on_click=self._reorder_select_index,
+                                               on_reorder=self._reorder_thumb_reordered, height=150)
         self.reorder_preview.pack(fill="both", expand=True, padx=6, pady=6)
 
         run_row = ttk.Frame(parent)
@@ -1028,11 +1141,22 @@ class PDFToolkitApp:
         self.reorder_file_label.config(text=os.path.basename(path))
         self._refresh_reorder_listbox()
 
-    def _refresh_reorder_listbox(self):
+    def _refresh_reorder_listbox_text(self):
         self.reorder_listbox.delete(0, "end")
         for i, (f, idx) in enumerate(self.reorder_entries, start=1):
             self.reorder_listbox.insert("end", f"{i:02d}. Page {idx + 1}")
+
+    def _refresh_reorder_listbox(self):
+        """Full refresh: listbox text + reload thumbnails from disk. Use whenever the
+        actual set of pages changes (remove/reset/open), not for pure reordering."""
+        self._refresh_reorder_listbox_text()
         self.reorder_preview.load_entries(self.reorder_entries)
+
+    def _reorder_thumb_reordered(self, from_idx, to_idx):
+        entry = self.reorder_entries.pop(from_idx)
+        self.reorder_entries.insert(to_idx, entry)
+        self._refresh_reorder_listbox_text()  # preview already updated itself instantly
+        self._reorder_select_index(to_idx)
 
     def _reorder_select_index(self, idx):
         self.reorder_listbox.selection_clear(0, "end")
