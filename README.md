@@ -8,10 +8,10 @@ Three tabs:
 
 **Merge & Compress**
 - **Merge**: combine any number of PDFs into one, in the order you list them.
-- **Edit Page Order...** *(optional)*: opens a page-by-page list, with a thumbnail preview,
-  so you can reorder or drop individual pages before merging — not just whole files. Click
-  a thumbnail to jump to it in the list. Leave it alone and merging works the normal way
-  (every page of every file, in list order).
+- **Edit Page Order...** *(optional)*: opens a page-by-page list with a thumbnail preview
+  so you can reorder or drop individual pages before merging — not just whole files. Drag a
+  thumbnail to move it, or click one to jump to it in the list. Leave it alone and merging
+  works the normal way (every page of every file, in list order).
 - **Compress**: shrink file size (downsamples/re-encodes embedded images + strips redundant
   data). If you select Compress **without** Merge, it compresses **every selected PDF
   separately** — you get one compressed output per input, not just one combined file.
@@ -29,8 +29,9 @@ Three tabs:
     each file's own page count, so mixed-length files in the same batch are handled correctly.
 
 **Reorder**
-- Open a single PDF, reorder or remove its own pages (with a click-to-jump thumbnail
-  preview), then Save As a new file. This is for when you just need to fix page order or
+- Open a single PDF, reorder or remove its own pages — drag a thumbnail to a new spot to
+  move it, or click a thumbnail to jump to it in the list and use Move Up/Move Down/Remove
+  Selected — then Save As a new file. This is for when you just need to fix page order or
   drop a page or two, without merging anything else in.
 
 All three tabs: bad/corrupt files in a batch are skipped and reported — they won't stop
@@ -97,7 +98,8 @@ still far lighter than the Electron/npm-based tools you tried).
 
 **To reorder a single PDF:**
 2. Switch to the **Reorder** tab, click **Open PDF...** → pick one file.
-3. Use **Move Up/Move Down/Remove Selected**, or click a thumbnail to jump to it in the list.
+3. Drag a thumbnail to move it, or click one to jump to it in the list and use
+   **Move Up/Move Down/Remove Selected**.
 4. Click **Save As...** and choose where to save the result.
 
 ## Notes
