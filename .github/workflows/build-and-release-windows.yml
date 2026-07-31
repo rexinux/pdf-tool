@@ -1,0 +1,58 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    outputs:
+      release-id: ${{ steps.create_release.outputs.id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+          pyinstaller --onefile --noconfirm --name pdf-toolkit pdf-toolkit.py
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/create-release@v1
+        with:
+          tag_name: ${{ github.ref == 'refs/heads/main' && format('{0}-{1}', github.run_number, github.sha) || github.ref_name }}
+          name: Release ${{ github.ref_name || github.run_number }}
+          body: Automated build from commit ${{ github.sha }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload EXE to Release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: dist\pdf-toolkit.exe
+          asset_name: pdf-toolkit.exe
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
