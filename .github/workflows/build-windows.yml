@@ -22,16 +22,21 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
-          if (Test-Path requirements.txt) { pip install -r requirements.txt }
+          pip install pymupdf pillow pyinstaller
 
-      - name: Build EXE with PyInstaller
+      - name: Build EXE with PyInstaller (console mode - easier to debug)
         shell: pwsh
         run: |
           if (Test-Path build) { Remove-Item -Recurse -Force build }
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
-          # Adjust the entry script name if your main script is different
-          pyinstaller --onefile --noconfirm --name pdf-toolkit pdf-toolkit.py
+          pyinstaller --onefile --noconfirm --name "PDF Toolkit" pdf-toolkit.py
+
+      - name: Show build warnings (if present)
+        shell: pwsh
+        run: |
+          if (Test-Path build) {
+            Get-ChildItem -Path build -Filter "warn-*.txt" -Recurse | ForEach-Object { Write-Host "`n=== WARNINGS: $($_.FullName) ===`n"; Get-Content $_.FullName }
+          }
 
       - name: List dist contents
         shell: pwsh
@@ -39,7 +44,7 @@ jobs:
           Get-ChildItem -Path dist -Recurse | Format-Table -AutoSize
 
       - name: Upload EXE artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pdf-tool-windows
           path: dist\*.exe
