@@ -1,5 +1,5 @@
 """
-PDF Toolkit - Merge, Compress, Split & Reorder - standalone desktop tool.
+PDF Toolkit - Merge, Compress, Split, Reorder & Unprotect - standalone desktop tool.
 
 Dependencies (only two, both single-purpose, no external binaries required):
     pip install pymupdf pillow
@@ -33,6 +33,14 @@ Reorder tab:
     and save as a new file. Internally this is a single-file merge, so it shares the
     exact same tested code path as the Merge tab's page-order feature.
 
+Unprotect tab:
+  - Add any number of password-protected PDFs; the same password is tried on all of them.
+  - Files that turn out not to need a password (including owner-password-only files with
+    restricted permissions but no open password) are handled too - just copied through,
+    no password needed.
+  - Wrong password / missing password on a given file is reported per-file, not fatal to
+    the batch. The password is only ever held in memory for the run - never logged.
+
 Text/OCR integrity:
   - Merge, Split, and Compress all copy page content structurally (PyMuPDF insert_pdf /
     image-xref replacement) rather than rastering anything, so an existing searchable/OCR
@@ -46,6 +54,7 @@ import io
 import tempfile
 import threading
 import traceback
+from functools import partial
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageTk
@@ -316,6 +325,62 @@ def split_batch(files, output_dir, mode, n=1, range_spec=None, log=None):
     return results
 
 
+def remove_password(input_path, output_path, password=None, log=None):
+    """Removes password protection / encryption from a single PDF.
+    If the file needs a password to open, one must be supplied and correct.
+    Files that don't need a password (including owner-password-only files with
+    restricted permissions but no open password) are handled the same way,
+    without requiring one. Returns {"needed_password": bool, "pages": int}."""
+    doc = fitz.open(input_path)
+    needed_password = bool(doc.needs_pass)
+    if needed_password:
+        if not password:
+            doc.close()
+            raise ValueError("This file is password-protected - a password is required.")
+        if doc.authenticate(password) == 0:
+            doc.close()
+            raise ValueError("Incorrect password.")
+    before_chars = _text_char_count(doc)
+    doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
+    pages = doc.page_count
+    doc.close()
+
+    out_doc = fitz.open(output_path)
+    after_chars = _text_char_count(out_doc)
+    out_doc.close()
+    _check_text_preserved(before_chars, after_chars, log, os.path.basename(input_path))
+
+    return {"needed_password": needed_password, "pages": pages}
+
+
+def unprotect_batch(files, output_dir, password=None, log=None):
+    """Removes password protection from any number of PDFs. The same password (if any)
+    is tried on every file. One bad/wrong-password file is skipped and reported, the
+    rest still get processed - same robustness contract as the other batch operations."""
+    def _log(m):
+        if log:
+            log(m)
+
+    if not files:
+        raise ValueError("No files provided.")
+    os.makedirs(output_dir, exist_ok=True)
+    results = {"ok": [], "failed": []}
+
+    for f in files:
+        base = os.path.splitext(os.path.basename(f))[0]
+        out = unique_path(os.path.join(output_dir, f"{base}_unprotected.pdf"))
+        try:
+            stats = remove_password(f, out, password=password, log=_log)
+            note = "password removed" if stats["needed_password"] else "was not password-protected (copied as-is)"
+            _log(f"  {os.path.basename(f)}: {note} -> {os.path.basename(out)}")
+            results["ok"].append((out, stats))
+        except Exception as e:
+            results["failed"].append((os.path.basename(f), str(e)))
+            _log(f"[error] {os.path.basename(f)}: {e}")
+
+    return results
+
+
 def process(files, output_dir, do_merge, do_compress, quality=65, max_dim=1600,
             merged_name="merged.pdf", page_entries=None, log=None):
     """
@@ -422,6 +487,7 @@ class ThumbnailStrip(ttk.Frame):
         self.on_reorder = on_reorder  # callback(from_index, to_index); enables dragging
         self._photo_refs = []
         self._load_token = 0
+        self._image_cache = {}     # (file, page_idx) -> PIL Image; persists across loads to skip re-render
         self._cells = []           # ordered list of the outer cell Frames
         self._labels = []          # ordered list of the image Labels (for drag highlight)
         self._number_labels = []   # ordered list of the page-number caption Labels
@@ -476,11 +542,17 @@ class ThumbnailStrip(ttk.Frame):
             images = []
             doc_cache = {}
             for f, idx in entries:
+                key = (f, idx)
+                cached = self._image_cache.get(key)
+                if cached is not None:
+                    images.append(cached)
+                    continue
                 if f not in doc_cache:
                     doc_cache[f] = fitz.open(f)
                 page = doc_cache[f][idx]
                 pix = page.get_pixmap(matrix=fitz.Matrix(self.THUMB_ZOOM, self.THUMB_ZOOM))
                 img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                self._image_cache[key] = img
                 images.append(img)
             for d in doc_cache.values():
                 d.close()
@@ -597,372 +669,61 @@ class ThumbnailStrip(ttk.Frame):
         return best_i
 
 
-class PageOrderDialog(tk.Toplevel):
-    def __init__(self, parent, files, existing_order=None, on_apply=None):
+class FileListPanel(ttk.Frame):
+    """Reusable Add/Remove/Clear PDF file list, optionally reorderable (Move Up/Down,
+    single-selection only - unambiguous, no multi-select edge cases). Shared by the
+    Merge, Split, and Unprotect tabs, which previously each hand-rolled this."""
+
+    def __init__(self, parent, on_change=None, reorderable=False):
         super().__init__(parent)
-        self.title("Edit Page Order")
-        self.geometry("560x660")
-        self.minsize(460, 520)
-        self.on_apply = on_apply
-        self._original_files = list(files)
-        self.entries = list(existing_order) if existing_order else default_page_entries(files)
-        self._build_ui()
-        self.transient(parent)
-        self.grab_set()
-
-    def _build_ui(self):
-        ttk.Label(self, text="Reorder or remove individual pages, then Apply.\n"
-                              "This only affects the Merge step. Click a thumbnail below to "
-                              "jump to it in the list.",
-                  justify="left").pack(padx=10, pady=(10, 4), anchor="w")
-
-        frame = ttk.Frame(self)
-        frame.pack(fill="both", expand=True, padx=10, pady=4)
-        self.listbox = tk.Listbox(frame, selectmode=tk.EXTENDED)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, command=self.listbox.yview)
-        scroll.pack(side="left", fill="y")
-        self.listbox.config(yscrollcommand=scroll.set)
-
-        btns = ttk.Frame(frame)
-        btns.pack(side="left", fill="y", padx=8)
-        ttk.Button(btns, text="Move Up", command=lambda: self._move(-1)).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Move Down", command=lambda: self._move(1)).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Remove Selected", command=self._remove_selected).pack(fill="x", pady=(12, 2))
-        ttk.Button(btns, text="Reset to Default", command=self._reset).pack(fill="x", pady=2)
-
-        preview_frame = ttk.LabelFrame(self, text="Preview")
-        preview_frame.pack(fill="both", expand=True, padx=10, pady=(4, 4))
-        self.preview = ThumbnailStrip(preview_frame, on_click=self._select_index,
-                                       on_reorder=self._thumb_reordered, height=150)
-        self.preview.pack(fill="both", expand=True, padx=6, pady=6)
-
-        bottom = ttk.Frame(self)
-        bottom.pack(fill="x", padx=10, pady=10)
-        ttk.Button(bottom, text="Apply", command=self._apply).pack(side="right", padx=4)
-        ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
-
-        self._refresh()
-
-    def _select_index(self, idx):
-        self.listbox.selection_clear(0, "end")
-        if 0 <= idx < self.listbox.size():
-            self.listbox.selection_set(idx)
-            self.listbox.see(idx)
-
-    def _thumb_reordered(self, from_idx, to_idx):
-        entry = self.entries.pop(from_idx)
-        self.entries.insert(to_idx, entry)
-        self._refresh_listbox_text()  # preview already updated itself instantly
-        self._select_index(to_idx)
-
-    def _refresh_listbox_text(self):
-        self.listbox.delete(0, "end")
-        counts = {}
-        for f, _ in self.entries:
-            if f not in counts:
-                try:
-                    d = fitz.open(f)
-                    counts[f] = d.page_count
-                    d.close()
-                except Exception:
-                    counts[f] = "?"
-        for i, (f, idx) in enumerate(self.entries, start=1):
-            self.listbox.insert("end", f"{i:02d}. {os.path.basename(f)} — page {idx + 1} of {counts.get(f, '?')}")
-
-    def _refresh(self):
-        """Full refresh: listbox text + reload thumbnails from disk. Use whenever the
-        actual set of pages changes (remove/reset/initial load), not for pure reordering."""
-        self._refresh_listbox_text()
-        self.preview.load_entries(self.entries)
-
-    def _move(self, direction):
-        sel = list(self.listbox.curselection())
-        if not sel:
-            return
-        order = sel if direction < 0 else list(reversed(sel))
-        new_sel = []
-        for i in order:
-            j = i + direction
-            if 0 <= j < len(self.entries):
-                self.entries[i], self.entries[j] = self.entries[j], self.entries[i]
-                new_sel.append(j)
-            else:
-                new_sel.append(i)
-        self._refresh()
-        for idx in new_sel:
-            self.listbox.selection_set(idx)
-
-    def _remove_selected(self):
-        for i in reversed(self.listbox.curselection()):
-            del self.entries[i]
-        self._refresh()
-
-    def _reset(self):
-        self.entries = default_page_entries(self._original_files)
-        self._refresh()
-
-    def _apply(self):
-        if not self.entries:
-            messagebox.showwarning("No pages", "At least one page must remain.", parent=self)
-            return
-        if self.on_apply:
-            self.on_apply(list(self.entries))
-        self.destroy()
-
-
-class PDFToolkitApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("PDF Toolkit - Merge, Compress & Split")
-        root.geometry("700x620")
-        root.minsize(600, 520)
-
         self.files = []
-        self.custom_page_order = None  # None = default natural order (old whole-file behavior)
-        self.output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
-        self.merge_var = tk.BooleanVar(value=True)
-        self.compress_var = tk.BooleanVar(value=True)
-        self.preset_var = tk.StringVar(value="Medium (recommended)")
-        self.merged_name_var = tk.StringVar(value="merged.pdf")
+        self.on_change = on_change
 
-        self.split_files = []
-        self.split_output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
-        self.split_mode = tk.StringVar(value="each_page")
-        self.split_n = tk.IntVar(value=5)
-        self.split_range_spec = tk.StringVar(value="")
-
-        self.reorder_file = None
-        self.reorder_entries = []
-
-        self._build_ui()
-
-    # -- UI construction --------------------------------------------------
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
-
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
-
-        tab1 = ttk.Frame(self.notebook)
-        tab2 = ttk.Frame(self.notebook)
-        tab3 = ttk.Frame(self.notebook)
-        self.notebook.add(tab1, text="Merge & Compress")
-        self.notebook.add(tab2, text="Split")
-        self.notebook.add(tab3, text="Reorder")
-
-        self._build_merge_tab(tab1, pad)
-        self._build_split_tab(tab2, pad)
-        self._build_reorder_tab(tab3, pad)
-
-    def _build_merge_tab(self, parent, pad):
-        # File list
-        list_frame = ttk.LabelFrame(parent, text="PDF files (order matters for Merge)")
-        list_frame.pack(fill="both", expand=True, **pad)
-
-        self.listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
+        self.listbox = tk.Listbox(self, selectmode=tk.EXTENDED)
         self.listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        scroll = ttk.Scrollbar(list_frame, command=self.listbox.yview)
+        scroll = ttk.Scrollbar(self, command=self.listbox.yview)
         scroll.pack(side="left", fill="y", pady=8)
         self.listbox.config(yscrollcommand=scroll.set)
 
-        btn_col = ttk.Frame(list_frame)
-        btn_col.pack(side="left", fill="y", padx=8, pady=8)
-        ttk.Button(btn_col, text="Add Files...", command=self.add_files).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Remove Selected", command=self.remove_selected).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Clear All", command=self.clear_all).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Move Up", command=lambda: self.move(-1)).pack(fill="x", pady=(12, 2))
-        ttk.Button(btn_col, text="Move Down", command=lambda: self.move(1)).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Edit Page Order...", command=self.open_page_order_dialog).pack(fill="x", pady=(12, 2))
+        self.button_col = ttk.Frame(self)  # exposed so callers can pack extra buttons (e.g. Edit Page Order)
+        self.button_col.pack(side="left", fill="y", padx=8, pady=8)
+        ttk.Button(self.button_col, text="Add Files...", command=self.add).pack(fill="x", pady=2)
+        ttk.Button(self.button_col, text="Remove Selected", command=self.remove_selected).pack(fill="x", pady=2)
+        ttk.Button(self.button_col, text="Clear All", command=self.clear).pack(fill="x", pady=2)
+        if reorderable:
+            ttk.Button(self.button_col, text="Move Up", command=lambda: self.move(-1)).pack(fill="x", pady=(12, 2))
+            ttk.Button(self.button_col, text="Move Down", command=lambda: self.move(1)).pack(fill="x", pady=2)
 
-        # Options
-        opt_frame = ttk.LabelFrame(parent, text="Options")
-        opt_frame.pack(fill="x", **pad)
+    def _notify(self):
+        if self.on_change:
+            self.on_change()
 
-        ttk.Checkbutton(opt_frame, text="Merge", variable=self.merge_var).grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        ttk.Checkbutton(opt_frame, text="Compress", variable=self.compress_var).grid(row=0, column=1, sticky="w", padx=8, pady=4)
-
-        ttk.Label(opt_frame, text="Compression level:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Combobox(opt_frame, textvariable=self.preset_var, state="readonly",
-                     values=list(COMPRESSION_PRESETS.keys()), width=22).grid(row=1, column=1, sticky="w", padx=8, pady=4)
-
-        ttk.Label(opt_frame, text="Merged file name:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(opt_frame, textvariable=self.merged_name_var, width=24).grid(row=2, column=1, sticky="w", padx=8, pady=4)
-
-        ttk.Label(opt_frame, text="Output folder:").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        out_row = ttk.Frame(opt_frame)
-        out_row.grid(row=3, column=1, columnspan=2, sticky="we", padx=8, pady=4)
-        ttk.Entry(out_row, textvariable=self.output_dir, width=40).pack(side="left", fill="x", expand=True)
-        ttk.Button(out_row, text="Browse...", command=self.pick_output_dir).pack(side="left", padx=(6, 0))
-
-        # Run
-        run_row = ttk.Frame(parent)
-        run_row.pack(fill="x", **pad)
-        self.run_btn = ttk.Button(run_row, text="Run", command=self.run_clicked)
-        self.run_btn.pack(side="left")
-        self.progress = ttk.Progressbar(run_row, mode="indeterminate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=10)
-
-        # Log
-        log_frame = ttk.LabelFrame(parent, text="Log")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.log_text = tk.Text(log_frame, height=8, state="disabled", wrap="word")
-        self.log_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-    def _build_split_tab(self, parent, pad):
-        list_frame = ttk.LabelFrame(parent, text="PDF files to split (each one is split independently)")
-        list_frame.pack(fill="both", expand=True, **pad)
-
-        self.split_listbox = tk.Listbox(list_frame, selectmode=tk.EXTENDED)
-        self.split_listbox.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        scroll = ttk.Scrollbar(list_frame, command=self.split_listbox.yview)
-        scroll.pack(side="left", fill="y", pady=8)
-        self.split_listbox.config(yscrollcommand=scroll.set)
-
-        btn_col = ttk.Frame(list_frame)
-        btn_col.pack(side="left", fill="y", padx=8, pady=8)
-        ttk.Button(btn_col, text="Add Files...", command=self.add_split_files).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Remove Selected", command=self.remove_split_selected).pack(fill="x", pady=2)
-        ttk.Button(btn_col, text="Clear All", command=self.clear_split_all).pack(fill="x", pady=2)
-
-        self.split_listbox.bind("<<ListboxSelect>>", self._on_split_select)
-
-        preview_frame = ttk.LabelFrame(parent, text="Preview (click a file above to see its pages)")
-        preview_frame.pack(fill="both", expand=True, **pad)
-        self.split_preview = ThumbnailStrip(preview_frame, height=150)
-        self.split_preview.pack(fill="both", expand=True, padx=6, pady=6)
-
-        mode_frame = ttk.LabelFrame(parent, text="Split mode")
-        mode_frame.pack(fill="x", **pad)
-
-        ttk.Radiobutton(mode_frame, text="One PDF per page", variable=self.split_mode,
-                         value="each_page").grid(row=0, column=0, sticky="w", padx=8, pady=4, columnspan=3)
-
-        ttk.Radiobutton(mode_frame, text="Every N pages:", variable=self.split_mode,
-                         value="every_n").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Spinbox(mode_frame, from_=1, to=999, textvariable=self.split_n, width=6).grid(
-            row=1, column=1, sticky="w", padx=4, pady=4)
-
-        ttk.Radiobutton(mode_frame, text="Custom page ranges:", variable=self.split_mode,
-                         value="custom_ranges").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(mode_frame, textvariable=self.split_range_spec, width=28).grid(
-            row=2, column=1, sticky="w", padx=4, pady=4)
-        ttk.Label(mode_frame, text="e.g. 1-3, 5, 7-end  (applied per file, against that file's own page count)",
-                  foreground="#555").grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
-
-        out_frame = ttk.LabelFrame(parent, text="Output")
-        out_frame.pack(fill="x", **pad)
-        ttk.Label(out_frame, text="Output folder:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
-        out_row = ttk.Frame(out_frame)
-        out_row.grid(row=0, column=1, sticky="we", padx=8, pady=4)
-        ttk.Entry(out_row, textvariable=self.split_output_dir, width=40).pack(side="left", fill="x", expand=True)
-        ttk.Button(out_row, text="Browse...", command=self.pick_split_output_dir).pack(side="left", padx=(6, 0))
-
-        run_row = ttk.Frame(parent)
-        run_row.pack(fill="x", **pad)
-        self.split_run_btn = ttk.Button(run_row, text="Split", command=self.split_clicked)
-        self.split_run_btn.pack(side="left")
-        self.split_progress = ttk.Progressbar(run_row, mode="indeterminate")
-        self.split_progress.pack(side="left", fill="x", expand=True, padx=10)
-
-        log_frame = ttk.LabelFrame(parent, text="Log")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.split_log_text = tk.Text(log_frame, height=8, state="disabled", wrap="word")
-        self.split_log_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-    def _build_reorder_tab(self, parent, pad):
-        ttk.Label(parent, text="Open a single PDF, reorder or remove its pages, "
-                                "then save. Page content is copied as-is - any existing "
-                                "searchable/OCR text layer is carried over unchanged "
-                                "(verified in the log below).",
-                  justify="left", wraplength=620).pack(padx=10, pady=(10, 4), anchor="w")
-
-        top = ttk.Frame(parent)
-        top.pack(fill="x", **pad)
-        ttk.Button(top, text="Open PDF...", command=self.open_reorder_file).pack(side="left")
-        self.reorder_file_label = ttk.Label(top, text="No file open.")
-        self.reorder_file_label.pack(side="left", padx=10)
-
-        frame = ttk.Frame(parent)
-        frame.pack(fill="both", expand=True, padx=10, pady=4)
-        self.reorder_listbox = tk.Listbox(frame, selectmode=tk.EXTENDED)
-        self.reorder_listbox.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(frame, command=self.reorder_listbox.yview)
-        scroll.pack(side="left", fill="y")
-        self.reorder_listbox.config(yscrollcommand=scroll.set)
-
-        btns = ttk.Frame(frame)
-        btns.pack(side="left", fill="y", padx=8)
-        ttk.Button(btns, text="Move Up", command=lambda: self.move_reorder(-1)).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Move Down", command=lambda: self.move_reorder(1)).pack(fill="x", pady=2)
-        ttk.Button(btns, text="Remove Selected", command=self.remove_reorder_selected).pack(fill="x", pady=(12, 2))
-        ttk.Button(btns, text="Reset to Original", command=self.reset_reorder).pack(fill="x", pady=2)
-
-        preview_frame = ttk.LabelFrame(parent, text="Preview (click a thumbnail to jump to it)")
-        preview_frame.pack(fill="both", expand=True, **pad)
-        self.reorder_preview = ThumbnailStrip(preview_frame, on_click=self._reorder_select_index,
-                                               on_reorder=self._reorder_thumb_reordered, height=150)
-        self.reorder_preview.pack(fill="both", expand=True, padx=6, pady=6)
-
-        run_row = ttk.Frame(parent)
-        run_row.pack(fill="x", **pad)
-        self.reorder_save_btn = ttk.Button(run_row, text="Save As...", command=self.save_reorder_clicked)
-        self.reorder_save_btn.pack(side="left")
-        self.reorder_progress = ttk.Progressbar(run_row, mode="indeterminate")
-        self.reorder_progress.pack(side="left", fill="x", expand=True, padx=10)
-
-        log_frame = ttk.LabelFrame(parent, text="Log")
-        log_frame.pack(fill="both", expand=True, **pad)
-        self.reorder_log_text = tk.Text(log_frame, height=6, state="disabled", wrap="word")
-        self.reorder_log_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-    def log(self, msg):
-        def _do():
-            self.log_text.config(state="normal")
-            self.log_text.insert("end", msg + "\n")
-            self.log_text.see("end")
-            self.log_text.config(state="disabled")
-        self.root.after(0, _do)
-
-    def add_files(self):
+    def add(self):
         paths = filedialog.askopenfilenames(title="Select PDF files", filetypes=[("PDF files", "*.pdf")])
+        added = False
         for p in paths:
             if p not in self.files:
                 self.files.append(p)
                 self.listbox.insert("end", os.path.basename(p))
-        if paths:
-            self._invalidate_custom_order()
+                added = True
+        if added:
+            self._notify()
 
     def remove_selected(self):
-        for i in reversed(self.listbox.curselection()):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        for i in reversed(sel):
             self.listbox.delete(i)
             del self.files[i]
-        self._invalidate_custom_order()
+        self._notify()
 
-    def clear_all(self):
+    def clear(self):
         self.listbox.delete(0, "end")
         self.files = []
-        self._invalidate_custom_order()
-
-    def _invalidate_custom_order(self):
-        if self.custom_page_order is not None:
-            self.custom_page_order = None
-            self.log("Note: file list changed - custom page order reset to default "
-                      "(use 'Edit Page Order...' again if needed).")
-
-    def open_page_order_dialog(self):
-        if not self.files:
-            messagebox.showinfo("No files", "Add PDF files first.")
-            return
-        PageOrderDialog(self.root, self.files, existing_order=self.custom_page_order,
-                         on_apply=self._set_custom_order)
-
-    def _set_custom_order(self, entries):
-        self.custom_page_order = entries
-        self.log(f"Custom page order applied: {len(entries)} page(s) in the new order.")
+        self._notify()
 
     def move(self, direction):
-        # single-item reorder only (unambiguous, no multi-select edge cases)
         sel = self.listbox.curselection()
         if len(sel) != 1:
             return
@@ -978,52 +739,428 @@ class PDFToolkitApp:
         self.listbox.insert(hi, text_i)
         self.listbox.selection_set(j)
 
-    def pick_output_dir(self):
+
+class PageOrderEditor(ttk.Frame):
+    """Editable, drag-reorderable page list + thumbnail preview. Shared by the Merge
+    tab's 'Edit Page Order' dialog and the standalone Reorder tab - previously two
+    separate, near-identical implementations."""
+
+    def __init__(self, parent, get_default_entries, label_fmt=None, min_pages=1):
+        super().__init__(parent)
+        self.entries = []
+        self.min_pages = min_pages
+        self._get_default_entries = get_default_entries
+        self._label_fmt = label_fmt or (
+            lambda i, f, idx, total: f"{i:02d}. {os.path.basename(f)} — page {idx + 1} of {total}")
+        self._count_cache = {}
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True)
+        self.listbox = tk.Listbox(frame, selectmode=tk.EXTENDED)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(frame, command=self.listbox.yview)
+        scroll.pack(side="left", fill="y")
+        self.listbox.config(yscrollcommand=scroll.set)
+
+        btns = ttk.Frame(frame)
+        btns.pack(side="left", fill="y", padx=8)
+        ttk.Button(btns, text="Move Up", command=lambda: self.move(-1)).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Move Down", command=lambda: self.move(1)).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Remove Selected", command=self.remove_selected).pack(fill="x", pady=(12, 2))
+        ttk.Button(btns, text="Reset", command=self.reset).pack(fill="x", pady=2)
+
+        preview_frame = ttk.LabelFrame(self, text="Preview (click a thumbnail to jump to it; drag to reorder)")
+        preview_frame.pack(fill="both", expand=True, pady=(6, 0))
+        self.preview = ThumbnailStrip(preview_frame, on_click=self.select_index,
+                                       on_reorder=self._thumb_reordered, height=150)
+        self.preview.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def set_entries(self, entries):
+        self.entries = list(entries)
+        self._count_cache.clear()
+        self._refresh_text()
+        self.preview.load_entries(self.entries)
+
+    def select_index(self, idx):
+        self.listbox.selection_clear(0, "end")
+        if 0 <= idx < self.listbox.size():
+            self.listbox.selection_set(idx)
+            self.listbox.see(idx)
+
+    def _page_count(self, f):
+        if f not in self._count_cache:
+            try:
+                d = fitz.open(f)
+                self._count_cache[f] = d.page_count
+                d.close()
+            except Exception:
+                self._count_cache[f] = "?"
+        return self._count_cache[f]
+
+    def _refresh_text(self):
+        self.listbox.delete(0, "end")
+        for i, (f, idx) in enumerate(self.entries, start=1):
+            self.listbox.insert("end", self._label_fmt(i, f, idx, self._page_count(f)))
+
+    def _thumb_reordered(self, from_idx, to_idx):
+        entry = self.entries.pop(from_idx)
+        self.entries.insert(to_idx, entry)
+        self._refresh_text()  # preview already updated itself instantly (local_reorder)
+        self.select_index(to_idx)
+
+    def move(self, direction):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        order = sel if direction < 0 else list(reversed(sel))
+        new_sel = []
+        for i in order:
+            j = i + direction
+            if 0 <= j < len(self.entries):
+                self.entries[i], self.entries[j] = self.entries[j], self.entries[i]
+                new_sel.append(j)
+            else:
+                new_sel.append(i)
+        self._refresh_text()
+        self.preview.load_entries(self.entries)
+        for idx in new_sel:
+            self.listbox.selection_set(idx)
+
+    def remove_selected(self):
+        sel = list(self.listbox.curselection())
+        if not sel:
+            return
+        if len(self.entries) - len(sel) < self.min_pages:
+            messagebox.showwarning("Cannot remove", f"At least {self.min_pages} page(s) must remain.")
+            return
+        for i in reversed(sel):
+            del self.entries[i]
+        self._refresh_text()
+        self.preview.load_entries(self.entries)
+
+    def reset(self):
+        self.entries = list(self._get_default_entries())
+        self._count_cache.clear()
+        self._refresh_text()
+        self.preview.load_entries(self.entries)
+
+
+class PageOrderDialog(tk.Toplevel):
+    """Thin modal wrapper around PageOrderEditor, for the Merge tab's optional
+    per-page (rather than per-file) ordering."""
+
+    def __init__(self, parent, files, existing_order=None, on_apply=None):
+        super().__init__(parent)
+        self.title("Edit Page Order")
+        self.geometry("560x660")
+        self.minsize(460, 520)
+        self.on_apply = on_apply
+
+        ttk.Label(self, text="Reorder or remove individual pages, then Apply.\n"
+                              "This only affects the Merge step.",
+                  justify="left").pack(padx=10, pady=(10, 4), anchor="w")
+
+        self.editor = PageOrderEditor(self, get_default_entries=lambda: default_page_entries(files))
+        self.editor.pack(fill="both", expand=True, padx=10, pady=4)
+        self.editor.set_entries(existing_order if existing_order else default_page_entries(files))
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=10, pady=10)
+        ttk.Button(bottom, text="Apply", command=self._apply).pack(side="right", padx=4)
+        ttk.Button(bottom, text="Cancel", command=self.destroy).pack(side="right")
+
+        self.transient(parent)
+        self.grab_set()
+
+    def _apply(self):
+        if not self.editor.entries:
+            messagebox.showwarning("No pages", "At least one page must remain.", parent=self)
+            return
+        if self.on_apply:
+            self.on_apply(list(self.editor.entries))
+        self.destroy()
+
+
+class PDFToolkitApp:
+    def __init__(self, root):
+        self.root = root
+        root.title("PDF Toolkit - Merge, Compress, Split, Reorder & Unprotect")
+        root.geometry("700x620")
+        root.minsize(600, 520)
+
+        self.custom_page_order = None  # None = default natural order (old whole-file behavior)
+        self.output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
+        self.merge_var = tk.BooleanVar(value=True)
+        self.compress_var = tk.BooleanVar(value=True)
+        self.preset_var = tk.StringVar(value="Medium (recommended)")
+        self.merged_name_var = tk.StringVar(value="merged.pdf")
+
+        self.split_output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
+        self.split_mode = tk.StringVar(value="each_page")
+        self.split_n = tk.IntVar(value=5)
+        self.split_range_spec = tk.StringVar(value="")
+
+        self.reorder_file = None
+
+        self.unprotect_password = tk.StringVar(value="")
+        self.unprotect_show_pw = tk.BooleanVar(value=False)
+        self.unprotect_output_dir = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Desktop"))
+
+        self._build_ui()
+
+    # -- generic helpers shared by every tab --------------------------------
+    def _log_to(self, widget, msg):
+        def _do():
+            widget.config(state="normal")
+            widget.insert("end", msg + "\n")
+            widget.see("end")
+            widget.config(state="disabled")
+        self.root.after(0, _do)
+
+    def _pick_dir(self, var):
         d = filedialog.askdirectory(title="Choose output folder")
         if d:
-            self.output_dir.set(d)
+            var.set(d)
 
-    # -- split tab: file list -------------------------------------------
-    def add_split_files(self):
-        paths = filedialog.askopenfilenames(title="Select PDF files", filetypes=[("PDF files", "*.pdf")])
-        for p in paths:
-            if p not in self.split_files:
-                self.split_files.append(p)
-                self.split_listbox.insert("end", os.path.basename(p))
+    def _start_job(self, btn, progress, log_text):
+        btn.config(state="disabled")
+        progress.start(12)
+        log_text.config(state="normal")
+        log_text.delete("1.0", "end")
+        log_text.config(state="disabled")
 
-    def remove_split_selected(self):
-        for i in reversed(self.split_listbox.curselection()):
-            self.split_listbox.delete(i)
-            del self.split_files[i]
-        self.split_preview.clear()
+    def _run_batch(self, fn, job_kwargs, log_fn, progress, btn, output_dir, noun="output file", failure_hint=""):
+        """Runs one of the *_batch()/process() functions, reports ok/failed counts to the
+        log and a popup, then re-enables the UI. Shared by Merge/Split/Unprotect, which
+        previously each hand-rolled this exact try/except/finally shape."""
+        try:
+            results = fn(**job_kwargs)
+            ok, failed = results["ok"], results["failed"]
+            log_fn(f"\nDone. {len(ok)} {noun}(s) created, {len(failed)} failed.")
+            if failed:
+                log_fn("Failed:")
+                for name, reason in failed:
+                    log_fn(f"  - {name}: {reason}")
+            msg = f"{len(ok)} {noun}(s) created in:\n{output_dir}"
+            if failed:
+                msg += f"\n\n{len(failed)} file(s) failed - see log.{failure_hint}"
+            self.root.after(0, lambda: messagebox.showinfo("Finished", msg))
+        except Exception as e:
+            log_fn(f"\n[fatal] {e}\n{traceback.format_exc()}")
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+        finally:
+            self.root.after(0, progress.stop)
+            self.root.after(0, lambda: btn.config(state="normal"))
 
-    def clear_split_all(self):
-        self.split_listbox.delete(0, "end")
-        self.split_files = []
-        self.split_preview.clear()
+    def _build_labeled_dir_row(self, parent, label, var, pick_cmd, **pad):
+        frame = ttk.LabelFrame(parent, text=label)
+        frame.pack(fill="x", **pad)
+        row = ttk.Frame(frame)
+        row.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(row, textvariable=var, width=40).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=pick_cmd).pack(side="left", padx=(6, 0))
+        return frame
 
+    def _build_run_row(self, parent, text, command, **pad):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", **pad)
+        btn = ttk.Button(row, text=text, command=command)
+        btn.pack(side="left")
+        progress = ttk.Progressbar(row, mode="indeterminate")
+        progress.pack(side="left", fill="x", expand=True, padx=10)
+        return btn, progress
+
+    def _build_log_box(self, parent, height=8, **pad):
+        frame = ttk.LabelFrame(parent, text="Log")
+        frame.pack(fill="both", expand=True, **pad)
+        text = tk.Text(frame, height=height, state="disabled", wrap="word")
+        text.pack(fill="both", expand=True, padx=8, pady=8)
+        return text
+
+    # -- UI construction ----------------------------------------------------
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
+
+        tabs = [("Merge & Compress", self._build_merge_tab),
+                ("Split", self._build_split_tab),
+                ("Reorder", self._build_reorder_tab),
+                ("Unprotect", self._build_unprotect_tab)]
+        for title, builder in tabs:
+            frame = ttk.Frame(self.notebook)
+            self.notebook.add(frame, text=title)
+            builder(frame, pad)
+
+    def _build_merge_tab(self, parent, pad):
+        list_frame = ttk.LabelFrame(parent, text="PDF files (order matters for Merge)")
+        list_frame.pack(fill="both", expand=True, **pad)
+        self.merge_panel = FileListPanel(list_frame, on_change=self._invalidate_custom_order, reorderable=True)
+        self.merge_panel.pack(fill="both", expand=True)
+        ttk.Button(self.merge_panel.button_col, text="Edit Page Order...",
+                   command=self.open_page_order_dialog).pack(fill="x", pady=(12, 2))
+
+        opt_frame = ttk.LabelFrame(parent, text="Options")
+        opt_frame.pack(fill="x", **pad)
+        ttk.Checkbutton(opt_frame, text="Merge", variable=self.merge_var).grid(
+            row=0, column=0, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(opt_frame, text="Compress", variable=self.compress_var).grid(
+            row=0, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(opt_frame, text="Compression level:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Combobox(opt_frame, textvariable=self.preset_var, state="readonly",
+                     values=list(COMPRESSION_PRESETS.keys()), width=22).grid(row=1, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(opt_frame, text="Merged file name:").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(opt_frame, textvariable=self.merged_name_var, width=24).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(opt_frame, text="Output folder:").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        out_row = ttk.Frame(opt_frame)
+        out_row.grid(row=3, column=1, columnspan=2, sticky="we", padx=8, pady=4)
+        ttk.Entry(out_row, textvariable=self.output_dir, width=40).pack(side="left", fill="x", expand=True)
+        ttk.Button(out_row, text="Browse...",
+                   command=partial(self._pick_dir, self.output_dir)).pack(side="left", padx=(6, 0))
+
+        self.run_btn, self.progress = self._build_run_row(parent, "Run", self.run_clicked, **pad)
+        self.log_text = self._build_log_box(parent, **pad)
+        self.log = partial(self._log_to, self.log_text)
+
+    def _build_split_tab(self, parent, pad):
+        list_frame = ttk.LabelFrame(parent, text="PDF files to split (each one is split independently)")
+        list_frame.pack(fill="both", expand=True, **pad)
+        self.split_panel = FileListPanel(list_frame, on_change=lambda: self.split_preview.clear())
+        self.split_panel.pack(fill="both", expand=True)
+        self.split_panel.listbox.bind("<<ListboxSelect>>", self._on_split_select)
+
+        preview_frame = ttk.LabelFrame(parent, text="Preview (click a file above to see its pages)")
+        preview_frame.pack(fill="both", expand=True, **pad)
+        self.split_preview = ThumbnailStrip(preview_frame, height=150)
+        self.split_preview.pack(fill="both", expand=True, padx=6, pady=6)
+
+        mode_frame = ttk.LabelFrame(parent, text="Split mode")
+        mode_frame.pack(fill="x", **pad)
+        ttk.Radiobutton(mode_frame, text="One PDF per page", variable=self.split_mode,
+                         value="each_page").grid(row=0, column=0, sticky="w", padx=8, pady=4, columnspan=3)
+        ttk.Radiobutton(mode_frame, text="Every N pages:", variable=self.split_mode,
+                         value="every_n").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Spinbox(mode_frame, from_=1, to=999, textvariable=self.split_n, width=6).grid(
+            row=1, column=1, sticky="w", padx=4, pady=4)
+        ttk.Radiobutton(mode_frame, text="Custom page ranges:", variable=self.split_mode,
+                         value="custom_ranges").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(mode_frame, textvariable=self.split_range_spec, width=28).grid(
+            row=2, column=1, sticky="w", padx=4, pady=4)
+        ttk.Label(mode_frame, text="e.g. 1-3, 5, 7-end  (applied per file, against that file's own page count)",
+                  foreground="#555").grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+
+        self._build_labeled_dir_row(parent, "Output", self.split_output_dir,
+                                     partial(self._pick_dir, self.split_output_dir), **pad)
+
+        self.split_run_btn, self.split_progress = self._build_run_row(parent, "Split", self.split_clicked, **pad)
+        self.split_log_text = self._build_log_box(parent, **pad)
+        self.log_split = partial(self._log_to, self.split_log_text)
+
+    def _build_reorder_tab(self, parent, pad):
+        ttk.Label(parent, text="Open a single PDF, reorder or remove its pages, "
+                                "then save. Page content is copied as-is - any existing "
+                                "searchable/OCR text layer is carried over unchanged "
+                                "(verified in the log below).",
+                  justify="left", wraplength=620).pack(padx=10, pady=(10, 4), anchor="w")
+
+        top = ttk.Frame(parent)
+        top.pack(fill="x", **pad)
+        ttk.Button(top, text="Open PDF...", command=self.open_reorder_file).pack(side="left")
+        self.reorder_file_label = ttk.Label(top, text="No file open.")
+        self.reorder_file_label.pack(side="left", padx=10)
+
+        self.reorder_editor = PageOrderEditor(
+            parent,
+            get_default_entries=lambda: default_page_entries([self.reorder_file]) if self.reorder_file else [],
+            label_fmt=lambda i, f, idx, total: f"{i:02d}. Page {idx + 1}",
+        )
+        self.reorder_editor.pack(fill="both", expand=True, padx=10, pady=4)
+
+        self.reorder_save_btn, self.reorder_progress = self._build_run_row(
+            parent, "Save As...", self.save_reorder_clicked, **pad)
+        self.reorder_log_text = self._build_log_box(parent, height=6, **pad)
+        self.log_reorder = partial(self._log_to, self.reorder_log_text)
+
+    def _build_unprotect_tab(self, parent, pad):
+        ttk.Label(parent, text="Add password-protected PDFs, enter the password, and get "
+                                "back passwordless copies. The same password is tried on "
+                                "every file; files that turn out not to be protected are "
+                                "just copied through as-is. The password is only held in "
+                                "memory for this run - never written to the log or saved.",
+                  justify="left", wraplength=620).pack(padx=10, pady=(10, 4), anchor="w")
+
+        list_frame = ttk.LabelFrame(parent, text="Protected PDF files")
+        list_frame.pack(fill="both", expand=True, **pad)
+        self.unprotect_panel = FileListPanel(list_frame)
+        self.unprotect_panel.pack(fill="both", expand=True)
+
+        pw_frame = ttk.LabelFrame(parent, text="Password")
+        pw_frame.pack(fill="x", **pad)
+        ttk.Label(pw_frame, text="Password:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
+        self.unprotect_pw_entry = ttk.Entry(pw_frame, textvariable=self.unprotect_password, show="*", width=28)
+        self.unprotect_pw_entry.grid(row=0, column=1, sticky="w", padx=4, pady=6)
+        ttk.Checkbutton(pw_frame, text="Show password", variable=self.unprotect_show_pw,
+                         command=self._toggle_unprotect_pw_visibility).grid(row=0, column=2, sticky="w", padx=8)
+
+        self._build_labeled_dir_row(parent, "Output", self.unprotect_output_dir,
+                                     partial(self._pick_dir, self.unprotect_output_dir), **pad)
+
+        self.unprotect_run_btn, self.unprotect_progress = self._build_run_row(
+            parent, "Remove Password", self.unprotect_clicked, **pad)
+        self.unprotect_log_text = self._build_log_box(parent, **pad)
+        self.log_unprotect = partial(self._log_to, self.unprotect_log_text)
+
+    # -- merge tab ------------------------------------------------------
+    def _invalidate_custom_order(self):
+        if self.custom_page_order is not None:
+            self.custom_page_order = None
+            self.log("Note: file list changed - custom page order reset to default "
+                      "(use 'Edit Page Order...' again if needed).")
+
+    def open_page_order_dialog(self):
+        if not self.merge_panel.files:
+            messagebox.showinfo("No files", "Add PDF files first.")
+            return
+        PageOrderDialog(self.root, self.merge_panel.files, existing_order=self.custom_page_order,
+                         on_apply=self._set_custom_order)
+
+    def _set_custom_order(self, entries):
+        self.custom_page_order = entries
+        self.log(f"Custom page order applied: {len(entries)} page(s) in the new order.")
+
+    def run_clicked(self):
+        if not self.merge_panel.files:
+            messagebox.showwarning("No files", "Add at least one PDF file first.")
+            return
+        if not self.merge_var.get() and not self.compress_var.get():
+            messagebox.showwarning("No option selected", "Tick Merge, Compress, or both.")
+            return
+        self._start_job(self.run_btn, self.progress, self.log_text)
+        preset = COMPRESSION_PRESETS[self.preset_var.get()]
+        out_dir = self.output_dir.get().strip()
+        job_kwargs = dict(
+            files=list(self.merge_panel.files), output_dir=out_dir,
+            do_merge=self.merge_var.get(), do_compress=self.compress_var.get(),
+            quality=preset["quality"], max_dim=preset["max_dim"],
+            merged_name=self.merged_name_var.get().strip() or "merged.pdf",
+            page_entries=self.custom_page_order, log=self.log,
+        )
+        threading.Thread(
+            target=self._run_batch,
+            args=(process, job_kwargs, self.log, self.progress, self.run_btn, out_dir),
+            daemon=True,
+        ).start()
+
+    # -- split tab --------------------------------------------------------
     def _on_split_select(self, event=None):
-        sel = self.split_listbox.curselection()
+        sel = self.split_panel.listbox.curselection()
         if len(sel) == 1:
-            self.split_preview.load(self.split_files[sel[0]])
+            self.split_preview.load(self.split_panel.files[sel[0]])
         else:
             self.split_preview.clear()
 
-    def pick_split_output_dir(self):
-        d = filedialog.askdirectory(title="Choose output folder")
-        if d:
-            self.split_output_dir.set(d)
-
-    def log_split(self, msg):
-        def _do():
-            self.split_log_text.config(state="normal")
-            self.split_log_text.insert("end", msg + "\n")
-            self.split_log_text.see("end")
-            self.split_log_text.config(state="disabled")
-        self.root.after(0, _do)
-
     def split_clicked(self):
-        if not self.split_files:
+        if not self.split_panel.files:
             messagebox.showwarning("No files", "Add at least one PDF file first.")
             return
         mode = self.split_mode.get()
@@ -1037,93 +1174,15 @@ class PDFToolkitApp:
         if mode == "every_n" and n < 1:
             messagebox.showwarning("Invalid N", "'Every N pages' must be 1 or more.")
             return
-
-        self.split_run_btn.config(state="disabled")
-        self.split_progress.start(12)
-        self.split_log_text.config(state="normal")
-        self.split_log_text.delete("1.0", "end")
-        self.split_log_text.config(state="disabled")
-
-        args = dict(
-            files=list(self.split_files),
-            output_dir=self.split_output_dir.get().strip(),
-            mode=mode,
-            n=n,
-            range_spec=self.split_range_spec.get().strip(),
-            log=self.log_split,
-        )
-        threading.Thread(target=self._split_worker, kwargs=args, daemon=True).start()
-
-    def _split_worker(self, **kwargs):
-        try:
-            results = split_batch(**kwargs)
-            ok, failed = results["ok"], results["failed"]
-            self.log_split(f"\nDone. {len(ok)} output file(s) created, {len(failed)} input file(s) failed.")
-            if failed:
-                self.log_split("Failed:")
-                for name, reason in failed:
-                    self.log_split(f"  - {name}: {reason}")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Finished",
-                f"{len(ok)} output file(s) created in:\n{kwargs['output_dir']}"
-                + (f"\n\n{len(failed)} file(s) failed - see log." if failed else "")
-            ))
-        except Exception as e:
-            self.log_split(f"\n[fatal] {e}\n{traceback.format_exc()}")
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-        finally:
-            self.root.after(0, self.split_progress.stop)
-            self.root.after(0, lambda: self.split_run_btn.config(state="normal"))
-
-    # -- run ------------------------------------------------------------
-    def run_clicked(self):
-        if not self.files:
-            messagebox.showwarning("No files", "Add at least one PDF file first.")
-            return
-        if not self.merge_var.get() and not self.compress_var.get():
-            messagebox.showwarning("No option selected", "Tick Merge, Compress, or both.")
-            return
-
-        self.run_btn.config(state="disabled")
-        self.progress.start(12)
-        self.log_text.config(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.config(state="disabled")
-
-        preset = COMPRESSION_PRESETS[self.preset_var.get()]
-        args = dict(
-            files=list(self.files),
-            output_dir=self.output_dir.get().strip(),
-            do_merge=self.merge_var.get(),
-            do_compress=self.compress_var.get(),
-            quality=preset["quality"],
-            max_dim=preset["max_dim"],
-            merged_name=self.merged_name_var.get().strip() or "merged.pdf",
-            page_entries=self.custom_page_order,
-            log=self.log,
-        )
-        threading.Thread(target=self._run_worker, kwargs=args, daemon=True).start()
-
-    def _run_worker(self, **kwargs):
-        try:
-            results = process(**kwargs)
-            ok, failed = results["ok"], results["failed"]
-            self.log(f"\nDone. {len(ok)} output file(s) created, {len(failed)} file(s) failed.")
-            if failed:
-                self.log("Failed:")
-                for name, reason in failed:
-                    self.log(f"  - {name}: {reason}")
-            self.root.after(0, lambda: messagebox.showinfo(
-                "Finished",
-                f"{len(ok)} output file(s) created in:\n{kwargs['output_dir']}"
-                + (f"\n\n{len(failed)} file(s) failed - see log." if failed else "")
-            ))
-        except Exception as e:
-            self.log(f"\n[fatal] {e}\n{traceback.format_exc()}")
-            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
-        finally:
-            self.root.after(0, self.progress.stop)
-            self.root.after(0, lambda: self.run_btn.config(state="normal"))
+        self._start_job(self.split_run_btn, self.split_progress, self.split_log_text)
+        out_dir = self.split_output_dir.get().strip()
+        job_kwargs = dict(files=list(self.split_panel.files), output_dir=out_dir, mode=mode, n=n,
+                           range_spec=self.split_range_spec.get().strip(), log=self.log_split)
+        threading.Thread(
+            target=self._run_batch,
+            args=(split_batch, job_kwargs, self.log_split, self.split_progress, self.split_run_btn, out_dir),
+            daemon=True,
+        ).start()
 
     # -- reorder tab ------------------------------------------------------
     def open_reorder_file(self):
@@ -1137,97 +1196,22 @@ class PDFToolkitApp:
             messagebox.showerror("Cannot open file", str(e))
             return
         self.reorder_file = path
-        self.reorder_entries = default_page_entries([path])
         self.reorder_file_label.config(text=os.path.basename(path))
-        self._refresh_reorder_listbox()
-
-    def _refresh_reorder_listbox_text(self):
-        self.reorder_listbox.delete(0, "end")
-        for i, (f, idx) in enumerate(self.reorder_entries, start=1):
-            self.reorder_listbox.insert("end", f"{i:02d}. Page {idx + 1}")
-
-    def _refresh_reorder_listbox(self):
-        """Full refresh: listbox text + reload thumbnails from disk. Use whenever the
-        actual set of pages changes (remove/reset/open), not for pure reordering."""
-        self._refresh_reorder_listbox_text()
-        self.reorder_preview.load_entries(self.reorder_entries)
-
-    def _reorder_thumb_reordered(self, from_idx, to_idx):
-        entry = self.reorder_entries.pop(from_idx)
-        self.reorder_entries.insert(to_idx, entry)
-        self._refresh_reorder_listbox_text()  # preview already updated itself instantly
-        self._reorder_select_index(to_idx)
-
-    def _reorder_select_index(self, idx):
-        self.reorder_listbox.selection_clear(0, "end")
-        if 0 <= idx < self.reorder_listbox.size():
-            self.reorder_listbox.selection_set(idx)
-            self.reorder_listbox.see(idx)
-
-    def move_reorder(self, direction):
-        sel = list(self.reorder_listbox.curselection())
-        if not sel:
-            return
-        order = sel if direction < 0 else list(reversed(sel))
-        new_sel = []
-        for i in order:
-            j = i + direction
-            if 0 <= j < len(self.reorder_entries):
-                self.reorder_entries[i], self.reorder_entries[j] = self.reorder_entries[j], self.reorder_entries[i]
-                new_sel.append(j)
-            else:
-                new_sel.append(i)
-        self._refresh_reorder_listbox()
-        for idx in new_sel:
-            self.reorder_listbox.selection_set(idx)
-
-    def remove_reorder_selected(self):
-        sel = list(self.reorder_listbox.curselection())
-        if not sel:
-            return
-        if len(sel) >= len(self.reorder_entries):
-            messagebox.showwarning("Cannot remove all pages", "At least one page must remain.")
-            return
-        for i in reversed(sel):
-            del self.reorder_entries[i]
-        self._refresh_reorder_listbox()
-
-    def reset_reorder(self):
-        if not self.reorder_file:
-            return
-        self.reorder_entries = default_page_entries([self.reorder_file])
-        self._refresh_reorder_listbox()
-
-    def log_reorder(self, msg):
-        def _do():
-            self.reorder_log_text.config(state="normal")
-            self.reorder_log_text.insert("end", msg + "\n")
-            self.reorder_log_text.see("end")
-            self.reorder_log_text.config(state="disabled")
-        self.root.after(0, _do)
+        self.reorder_editor.set_entries(default_page_entries([path]))
 
     def save_reorder_clicked(self):
-        if not self.reorder_file or not self.reorder_entries:
+        if not self.reorder_file or not self.reorder_editor.entries:
             messagebox.showwarning("No file", "Open a PDF first.")
             return
         base = os.path.splitext(os.path.basename(self.reorder_file))[0]
-        suggested = f"{base}_reordered.pdf"
         out_path = filedialog.asksaveasfilename(
-            title="Save reordered PDF as",
-            defaultextension=".pdf",
-            initialfile=suggested,
-            filetypes=[("PDF files", "*.pdf")],
+            title="Save reordered PDF as", defaultextension=".pdf",
+            initialfile=f"{base}_reordered.pdf", filetypes=[("PDF files", "*.pdf")],
         )
         if not out_path:
             return
-
-        self.reorder_save_btn.config(state="disabled")
-        self.reorder_progress.start(12)
-        self.reorder_log_text.config(state="normal")
-        self.reorder_log_text.delete("1.0", "end")
-        self.reorder_log_text.config(state="disabled")
-
-        entries = list(self.reorder_entries)
+        self._start_job(self.reorder_save_btn, self.reorder_progress, self.reorder_log_text)
+        entries = list(self.reorder_editor.entries)
         threading.Thread(target=self._save_reorder_worker, args=(entries, out_path), daemon=True).start()
 
     def _save_reorder_worker(self, entries, out_path):
@@ -1241,6 +1225,29 @@ class PDFToolkitApp:
         finally:
             self.root.after(0, self.reorder_progress.stop)
             self.root.after(0, lambda: self.reorder_save_btn.config(state="normal"))
+
+    # -- unprotect tab ------------------------------------------------------
+    def _toggle_unprotect_pw_visibility(self):
+        self.unprotect_pw_entry.config(show="" if self.unprotect_show_pw.get() else "*")
+
+    def unprotect_clicked(self):
+        if not self.unprotect_panel.files:
+            messagebox.showwarning("No files", "Add at least one PDF file first.")
+            return
+        out_dir = self.unprotect_output_dir.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No output folder", "Choose an output folder.")
+            return
+        self._start_job(self.unprotect_run_btn, self.unprotect_progress, self.unprotect_log_text)
+        job_kwargs = dict(files=list(self.unprotect_panel.files), output_dir=out_dir,
+                           password=self.unprotect_password.get() or None, log=self.log_unprotect)
+        threading.Thread(
+            target=self._run_batch,
+            args=(unprotect_batch, job_kwargs, self.log_unprotect, self.unprotect_progress,
+                  self.unprotect_run_btn, out_dir),
+            kwargs={"noun": "file", "failure_hint": " (often a wrong password)"},
+            daemon=True,
+        ).start()
 
 
 def main():
