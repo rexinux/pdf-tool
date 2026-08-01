@@ -4,7 +4,7 @@ This gives you a double-clickable `PDF Toolkit.exe` — no Python knowledge need
 You only need Python once, to *build* the exe.
 
 ## What it does
-Three tabs:
+Four tabs:
 
 **Merge & Compress**
 - **Merge**: combine any number of PDFs into one, in the order you list them.
@@ -34,7 +34,15 @@ Three tabs:
   Selected — then Save As a new file. This is for when you just need to fix page order or
   drop a page or two, without merging anything else in.
 
-All three tabs: bad/corrupt files in a batch are skipped and reported — they won't stop
+**Unprotect**
+- Add any number of password-protected PDFs, enter the password once, click **Remove
+  Password**. The same password is tried on every file in the batch. A file that turns
+  out not to need a password is just copied through as-is - no need to sort your files
+  first. Wrong password on one file is reported and skipped; it won't stop the rest.
+- The password is only ever held in memory for that run - it's never written to the log
+  or saved anywhere.
+
+All four tabs: bad/corrupt files in a batch are skipped and reported — they won't stop
 the rest.
 
 ## Does it break OCR / searchable text?
@@ -56,9 +64,10 @@ in the log box after any run. If it ever shows a drop, it'll say `[WARNING]` ins
 2. Run it. **Tick "Add python.exe to PATH"** at the bottom of the first screen before clicking Install.
 
 ## Step 2 — Install the two dependencies + the packager
-Open **Command Prompt** (search "cmd" in the Start menu) and run:
+Put `requirements.txt` in the same folder as `pdf_toolkit.py`, open **Command Prompt**
+(search "cmd" in the Start menu) in that folder, and run:
 ```
-pip install pymupdf pillow pyinstaller
+pip install -r requirements.txt pyinstaller
 ```
 That's it — only 2 libraries for the app itself (`pymupdf` for reading/writing PDFs,
 `pillow` for image recompression), plus `pyinstaller` which is only needed to build the exe.
@@ -101,6 +110,11 @@ still far lighter than the Electron/npm-based tools you tried).
 3. Drag a thumbnail to move it, or click one to jump to it in the list and use
    **Move Up/Move Down/Remove Selected**.
 4. Click **Save As...** and choose where to save the result.
+
+**To remove a password:**
+2. Switch to the **Unprotect** tab, click **Add Files** → pick your protected PDFs.
+3. Type the password (check **Show password** if you want to see what you typed).
+4. Pick an **Output folder** and click **Remove Password**.
 
 ## Notes
 - If Windows SmartScreen warns about an "unrecognized app" the first time you run the exe,
