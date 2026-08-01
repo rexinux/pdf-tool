@@ -1,6 +1,7 @@
 # PDF Toolkit — Setup Guide (Windows)
 
 ~~ Built Using Claue ~~
+
 This gives you a double-clickable `PDF Toolkit.exe` — no Python knowledge needed to *use* it.
 You only need Python once, to *build* the exe.
 
