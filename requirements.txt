@@ -1,0 +1,10 @@
+# PDF Toolkit - runtime dependencies
+# Install with: pip install -r requirements.txt
+#
+# tkinter is not listed here - it ships with standard Python on Windows,
+# it isn't a pip package. On Linux, if tkinter is missing, install it via
+# your distro's package manager (e.g. `sudo pacman -S tk` on Arch,
+# `sudo apt install python3-tk` on Debian/Ubuntu) - see SETUP.md.
+
+pymupdf>=1.24.0
+pillow>=10.0.0
